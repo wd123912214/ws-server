@@ -1,7 +1,4 @@
-.DS_Store
-/dist/
-/coverage*.out
-/ws-server
-/ws-server.exe
-/logs/
+dist/
+data/
 config.json
+/ws-relay

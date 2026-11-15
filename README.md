@@ -1,89 +1,136 @@
-# Simple WS Relay
+# WS Relay
 
-面向 Windows Server 的纯内存 WebSocket 中转服务器。单文件运行，不使用数据库、不需要Docker、不需要SQLite或其他运行时。
+任务中转服务器：执行端通过 WebSocket 连接并用 UID 标识，发送端通过 HTTP 把任务发给指定 UID，服务器转发并把执行端的回复原样返回给发送端。
 
-## 功能
+- 单个可执行文件，无数据库、无运行时依赖，网页面板已打包在内
+- 同 UID 已在线时拒绝新连接（僵尸连接例外，见下文）
+- 目标离线立即告知发送方；执行中途断线立即返回，不用等超时
+- 违规 3 次自动拉黑（IP 和 UID 分别计数），黑名单存在 `data/bans.json`
+- 面板 `/panel`：在线执行端、违规记录、黑名单、踢人/拉黑/解封
 
-- 本地中控、本地客户端和管理员统一连接 `/ws`。
-- `X-UID`强制唯一，新连接替换同UID旧连接。
-- 配置文件UID白名单，非白名单UID拒绝连接。
-- 独立超级管理员Token可在线查询或全量替换白名单。
-- 内存记录当前进程中连接过的UID和当前在线UID。
-- 三段文本协议完成WS双向转发。
-- HTTP一次性API等待目标WS客户端回复。
-- 并发HTTP请求使用临时UID关联，不会串包。
-- 可配置间隔的普通文本心跳保活，兼容易语言HWA客户端。
-- 支持Windows原生服务和开机启动。
+协议细节见 [docs/PROTOCOL.md](docs/PROTOCOL.md)。执行端 SDK 在 `sdk/`（JS、Python，都不需要装依赖）。
 
-完整协议见 [docs/PROTOCOL.md](docs/PROTOCOL.md)，易语言HTTP与WS接入要点见 [docs/EASY_LANGUAGE.md](docs/EASY_LANGUAGE.md)。
+## 目录
 
-## Windows部署
-
-1. 解压发布包到固定目录，例如`C:\WSRelay`。
-2. 双击`start.bat`可在控制台运行。首次运行会自动生成带随机256位Token的`config.json`。
-3. 安装为服务时，以管理员身份运行PowerShell：
-
-```powershell
-cd C:\WSRelay
-Set-ExecutionPolicy -Scope Process Bypass
-.\install-service.ps1 -OpenFirewall
+```
+main.go      启动、信号处理
+config.go    config.json 读取与默认值
+hub.go       UID→连接、任务派发与等待回复
+server.go    WS 接入、HTTP 接口、违规判定
+guard.go     违规计数、黑名单（bans.json）
+panel.go     面板接口；panel.html 面板页面
+sdk/         执行端示例
 ```
 
-查看服务：
+以后改违规规则只需要看 `server.go` 里调用 `violate` 的地方。
 
-```powershell
-.\status.ps1
+## 宝塔部署
+
+### 1. 构建
+
+在任意装了 Go 1.24+ 的机器上：
+
+```bash
+./build.sh 1.0.0
 ```
 
-卸载服务但保留配置和日志：
+得到 `dist/ws-relay-1.0.0-linux-amd64.tar.gz`。服务器是 ARM 的话用 `ARCH=arm64 ./build.sh 1.0.0`。
 
-```powershell
-.\uninstall-service.ps1
+### 2. 上传
+
+解压后把 `ws-relay` 上传到 `/www/wwwroot/ws-relay/`，在宝塔文件管理里把权限设为 `755`。
+
+### 3. 添加 Go 项目
+
+宝塔 → 网站 → Go项目 → 添加：
+
+| 项 | 填写 |
+|---|---|
+| 项目执行文件 | `/www/wwwroot/ws-relay/ws-relay` |
+| 项目端口 | `8080` |
+| 执行命令 | `/www/wwwroot/ws-relay/ws-relay -config /www/wwwroot/ws-relay/config.json` |
+| 运行用户 | `www` |
+| 开机启动 | 勾选 |
+| 绑定域名 | 你的域名 |
+
+首次启动会生成 `config.json`，面板口令在项目日志里，也可以直接打开 `config.json` 看 `panel_password`。
+
+### 4. 检查反向代理配置（重要）
+
+打开该站点的配置文件（网站 → 设置 → 配置文件），确认反代 `location /` 里有下面几行，没有就补上：
+
+```nginx
+proxy_http_version 1.1;
+proxy_set_header Upgrade $http_upgrade;
+proxy_set_header Connection "upgrade";
+proxy_set_header Host $host;
+proxy_set_header X-Real-IP $remote_addr;
+proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+proxy_read_timeout 300s;
 ```
 
-## 配置
+- 前三行缺了 WebSocket 连不上。
+- `X-Real-IP` 缺了，服务器看到的 IP 全是 127.0.0.1。回环地址不会被拉黑，但这样一来 IP 拉黑也就完全不起作用了。
+- `proxy_read_timeout` 要大于心跳间隔，同时要大于 HTTP 任务的最长等待时间（`max_task_timeout`，默认 120 秒）。
+
+### 5. 访问
+
+- 面板：`http://你的域名/panel`
+- 执行端：`ws://你的域名/ws`（开了 SSL 就用 `wss://`）
+- 发送端：`POST http://你的域名/api/v1/task`
+
+默认监听 `127.0.0.1:8080`，只有 nginx 能访问，**不要**在宝塔安全里放行 8080。
+
+## 升级
+
+1. 在本地构建新版本。
+2. 在宝塔里停止项目，用新的 `ws-relay` 替换旧文件，再启动。
+3. `config.json` 和 `data/bans.json` 都会保留。执行端会断开几秒，SDK 会自动重连。
+4. `/healthz` 返回当前版本号，可以用来确认升级是否生效。
+
+配置新增字段时不需要手动改：缺少的字段会自动使用默认值。
+
+## 配置说明
 
 ```json
 {
-  "listen_addr": ":8080",
-  "token": "自动生成的64位十六进制Token",
-  "super_admin_token": "单独自动生成的64位十六进制Token",
-  "uid_whitelist": ["admin", "controller_001", "client_001"],
-  "request_timeout_ms": 10000,
-  "heartbeat_interval_seconds": 30,
+  "listen_addr": "127.0.0.1:8080",
+  "token": "",
+  "panel_password": "首次运行随机生成",
+  "trust_proxy": true,
+  "task_timeout": 30,
+  "max_task_timeout": 120,
+  "heartbeat": 30,
   "max_message_bytes": 65536,
-  "log_dir": "logs",
-  "debug": false
+  "violation_limit": 3,
+  "violation_window": 10,
+  "ban_minutes": 0,
+  "data_dir": "data"
 }
 ```
 
-- `heartbeat_interval_seconds`：服务器发送`0-heartbeat-N`文本心跳的间隔，必须大于0，默认30秒。
-- `debug`：设为`true`时输出`[WS-DEBUG]`连接、消息和心跳明细；正式运行建议保持`false`。
+| 字段 | 说明 |
+|---|---|
+| `token` | 共享 Token，留空表示不校验。执行端在注册消息里带上，发送端放在参数或 `X-Token` 头里 |
+| `trust_proxy` | 从 nginx 传来的头里取真实 IP。服务器直接对外、没有 nginx 时**必须**设为 `false`，否则别人可以伪造 IP |
+| `task_timeout` / `max_task_timeout` | HTTP 等待回复的默认秒数和上限秒数，调用方可以用 `timeout` 参数自行指定 |
+| `heartbeat` | 服务器发 ping 的间隔。超过 2.5 倍间隔没收到执行端任何消息就断开 |
+| `violation_limit` / `violation_window` | 在 `violation_window` 分钟内违规达到 `violation_limit` 次就拉黑 |
+| `ban_minutes` | 自动拉黑的时长（分钟），0 表示永久 |
 
-旧配置中的`ping_interval_seconds`仍可读取，但新字段优先。
+修改配置后需要重启项目才会生效。
 
-环境变量`WS_LISTEN_ADDR`、`WS_TOKEN`、`WS_SUPER_ADMIN_TOKEN`、`WS_LOG_DIR`可以覆盖对应配置。
+## 同 UID 规则
 
-新安装的白名单默认为空，需要超级管理员调用HTTP `/api`发送`8-8-uid1*uid2`，或者停止服务后直接编辑`uid_whitelist`。`7-7-7`用于查询当前白名单。
+同一个 UID 已经在线时，新连接会收到 `uid_in_use` 并被拒绝。
 
-从`0.1.x`升级时，需要先在原`config.json`中增加`super_admin_token`和`uid_whitelist`，然后再替换EXE并启动服务。普通Token与超级管理员Token不能相同。
+例外：如果旧连接已经超过 `heartbeat + 10` 秒（默认 40 秒）没有发过任何消息，就判定它是掉线后还没被发现的僵尸连接，由新连接接管。这样执行端断网重连时不会被自己的旧连接一直挡在外面。
 
-## 无数据库的含义
+## 本地开发
 
-所有历史UID和在线状态都只存在内存：
-
-- 服务进程重启后历史记录清空。
-- 不适合同时运行多个WS服务器实例；不同实例之间不会共享连接或历史。
-- 你的SQL系统可以通过管理员WS或HTTP `0-0-0`获取列表并自行持久化。
-
-## 公网安全
-
-该版本按需求只校验`X-Token`，使用明文HTTP/WS。公网链路上的Token和消息可能被截获或篡改。至少应限制防火墙来源IP；正式公网使用仍建议在前面增加TLS反向代理。
-
-## 本地构建
-
-```text
+```bash
 go test ./...
-go test -tags=integration ./integration
-go build ./cmd/ws-server
+go run . -config config.json
+node sdk/client.js ws://127.0.0.1:8080/ws js_demo
+python3 sdk/client.py ws://127.0.0.1:8080/ws py_demo
 ```

@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WS Relay 面板</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1d2129; --muted:#86909c; --line:#e5e6eb; --accent:#165dff; --ok:#00b42a; --warn:#ff7d00; --bad:#f53f3f; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; background:var(--bg); color:var(--text); }
+  header { display:flex; align-items:center; gap:12px; padding:12px 16px; background:var(--card); border-bottom:1px solid var(--line); position:sticky; top:0; z-index:1; }
+  header h1 { font-size:16px; margin:0; }
+  header .meta { color:var(--muted); font-size:12px; margin-left:auto; }
+  main { padding:16px; max-width:1200px; margin:0 auto; }
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(90px,1fr)); gap:8px; margin-bottom:16px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:8px 12px; }
+  .stat b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--muted); font-size:12px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; margin-bottom:16px; overflow:hidden; }
+  section h2 { font-size:14px; margin:0; padding:10px 12px; border-bottom:1px solid var(--line); display:flex; align-items:center; gap:8px; }
+  section h2 small { color:var(--muted); font-weight:normal; }
+  .scroll { overflow-x:auto; }
+  table { width:100%; border-collapse:collapse; white-space:nowrap; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:normal; font-size:12px; }
+  tr:last-child td { border-bottom:none; }
+  td.num { font-variant-numeric:tabular-nums; }
+  .empty { padding:16px 12px; color:var(--muted); }
+  button { font:inherit; border:1px solid var(--line); background:#fff; border-radius:6px; padding:3px 10px; cursor:pointer; }
+  button:hover { border-color:var(--accent); color:var(--accent); }
+  button.danger:hover { border-color:var(--bad); color:var(--bad); }
+  .tag { font-size:12px; padding:1px 6px; border-radius:4px; background:#f2f3f5; }
+  .tag.bad { background:#ffece8; color:var(--bad); }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:var(--ok); margin-right:6px; }
+  .dot.idle { background:var(--warn); }
+  form.inline { display:flex; gap:8px; flex-wrap:wrap; padding:10px 12px; border-bottom:1px solid var(--line); }
+  input, select { font:inherit; border:1px solid var(--line); border-radius:6px; padding:3px 8px; }
+  #login { max-width:320px; margin:15vh auto; background:var(--card); border:1px solid var(--line); border-radius:8px; padding:24px; }
+  #login input { width:100%; padding:8px; margin:12px 0; }
+  #login button { width:100%; padding:8px; background:var(--accent); color:#fff; border:none; }
+  .err { color:var(--bad); font-size:12px; min-height:18px; }
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <h3 style="margin:0">WS Relay 面板</h3>
+  <input id="pwd" type="password" placeholder="面板口令（config.json 里的 panel_password）" autocomplete="current-password">
+  <div class="err" id="loginErr"></div>
+  <button onclick="login()">进入</button>
+</div>
+
+<div id="app" hidden>
+  <header>
+    <h1>WS Relay</h1>
+    <span class="tag" id="ver"></span>
+    <span class="meta" id="meta"></span>
+    <button onclick="logout()">退出</button>
+  </header>
+  <main>
+    <div class="stats" id="stats"></div>
+
+    <section>
+      <h2>在线执行端 <small id="clientCount"></small></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>UID</th><th>IP</th><th>连接时长</th><th>最后活动</th><th>已派发</th><th>已完成</th><th>执行中</th><th></th></tr></thead>
+        <tbody id="clients"></tbody>
+      </table></div>
+    </section>
+
+    <section>
+      <h2>黑名单 <small id="banCount"></small></h2>
+      <form class="inline" onsubmit="manualBan(event)">
+        <select id="banKind"><option value="ip">IP</option><option value="uid">UID</option></select>
+        <input id="banValue" placeholder="IP 或 UID" required>
+        <input id="banMinutes" type="number" min="0" value="0" style="width:90px" title="分钟，0=永久">
+        <button type="submit" class="danger">拉黑</button>
+        <span style="color:var(--muted);font-size:12px;align-self:center">分钟，0 = 永久</span>
+      </form>
+      <div class="scroll"><table>
+        <thead><tr><th>类型</th><th>值</th><th>原因</th><th>时间</th><th>到期</th><th></th></tr></thead>
+        <tbody id="bans"></tbody>
+      </table></div>
+    </section>
+
+    <section>
+      <h2>最近违规 <small>最多 200 条，重启清空</small></h2>
+      <div class="scroll"><table>
+        <thead><tr><th>时间</th><th>类型</th><th>值</th><th>原因</th><th>计数</th><th></th></tr></thead>
+        <tbody id="violations"></tbody>
+      </table></div>
+    </section>
+  </main>
+</div>
+
+<script>
+let pwd = '';
+try { pwd = localStorage.getItem('panel_pwd') || ''; } catch (e) {}
+let timer = null;
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtTime = t => t ? new Date(t * 1000).toLocaleString('zh-CN', {hour12:false}) : '';
+function fmtDur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (d) return `${d}天${h}时`;
+  if (h) return `${h}时${m}分`;
+  if (m) return `${m}分${s}秒`;
+  return `${s}秒`;
+}
+
+async function api(path, body) {
+  const opt = { headers: { 'X-Panel-Password': pwd } };
+  if (body) { opt.method = 'POST'; opt.headers['Content-Type'] = 'application/json'; opt.body = JSON.stringify(body); }
+  const res = await fetch(path, opt);
+  if (res.status === 401 || res.status === 403) throw new Error(res.status === 403 ? '该IP已被拉黑' : '口令错误');
+  if (!res.ok) throw new Error('请求失败 ' + res.status);
+  return res.json();
+}
+
+async function login() {
+  pwd = $('pwd').value.trim();
+  try { await refresh(); try { localStorage.setItem('panel_pwd', pwd); } catch (e) {} showApp(); }
+  catch (e) { $('loginErr').textContent = e.message + '（连续错误 3 次会被拉黑）'; }
+}
+function logout() { try { localStorage.removeItem('panel_pwd'); } catch (e) {} pwd = ''; clearInterval(timer); $('app').hidden = true; $('login').hidden = false; }
+function showApp() { $('login').hidden = true; $('app').hidden = false; clearInterval(timer); timer = setInterval(() => refresh().catch(() => {}), 2000); }
+
+async function refresh() {
+  const s = await api('/panel/api/state');
+  $('ver').textContent = 'v' + s.version;
+  $('meta').textContent = '已运行 ' + fmtDur(s.now - s.started);
+  const st = s.stats;
+  $('stats').innerHTML = [
+    ['在线', s.clients.length], ['任务总数', st.total], ['成功', st.ok],
+    ['离线', st.offline], ['超时', st.timeout], ['中途断线', st.disconnected], ['黑名单', s.bans.length],
+  ].map(([k, v]) => `<div class="stat"><b>${v}</b><span>${k}</span></div>`).join('');
+
+  $('clientCount').textContent = s.clients.length;
+  $('clients').innerHTML = s.clients.length ? s.clients.map(c => {
+    const idle = s.now - c.last_seen;
+    return `<tr>
+      <td><span class="dot ${idle > 45 ? 'idle' : ''}"></span>${esc(c.uid)}</td>
+      <td>${esc(c.ip)}</td>
+      <td>${fmtDur(s.now - c.connected_at)}</td>
+      <td>${fmtDur(idle)}前</td>
+      <td class="num">${c.sent}</td><td class="num">${c.done}</td><td class="num">${c.pending}</td>
+      <td><button onclick="kick('${esc(c.uid)}')">踢下线</button>
+          <button class="danger" onclick="ban('uid','${esc(c.uid)}')">拉黑UID</button>
+          <button class="danger" onclick="ban('ip','${esc(c.ip)}')">拉黑IP</button></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="8" class="empty">暂无在线执行端</td></tr>';
+
+  $('banCount').textContent = s.bans.length;
+  $('bans').innerHTML = s.bans.length ? s.bans.map(b => `<tr>
+      <td><span class="tag">${b.kind.toUpperCase()}</span></td>
+      <td>${esc(b.value)}</td><td>${esc(b.reason)}</td><td>${fmtTime(b.at)}</td>
+      <td>${b.until ? fmtTime(b.until) : '永久'}</td>
+      <td><button onclick="unban('${esc(b.key)}')">解封</button></td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">黑名单为空</td></tr>';
+
+  $('violations').innerHTML = s.violations.length ? s.violations.map(v => `<tr>
+      <td>${fmtTime(v.at)}</td><td><span class="tag">${v.kind.toUpperCase()}</span></td>
+      <td>${esc(v.value)}</td><td>${esc(v.reason)}</td><td class="num">${v.count}/${s.limit}</td>
+      <td>${v.banned ? '<span class="tag bad">已拉黑</span>' : ''}</td>
+    </tr>`).join('') : '<tr><td colspan="6" class="empty">暂无违规</td></tr>';
+}
+
+async function kick(uid) { await api('/panel/api/kick', { uid }); refresh(); }
+async function ban(kind, value) {
+  const m = prompt(`拉黑 ${kind.toUpperCase()} ${value}\n输入时长（分钟），0 = 永久`, '0');
+  if (m === null) return;
+  await api('/panel/api/ban', { kind, value, minutes: parseInt(m) || 0 }); refresh();
+}
+async function unban(key) { await api('/panel/api/unban', { key }); refresh(); }
+async function manualBan(e) {
+  e.preventDefault();
+  await api('/panel/api/ban', { kind: $('banKind').value, value: $('banValue').value.trim(), minutes: parseInt($('banMinutes').value) || 0 });
+  $('banValue').value = ''; refresh();
+}
+
+$('pwd').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+if (pwd) refresh().then(showApp).catch(() => { $('login').hidden = false; });
+else $('login').hidden = false;
+</script>
+</body>
+</html>
